@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forecast GTA VI's launch-day Twitch viewers hour by hour (make.fun v2).
+"""Forecast GTA VI's launch-day Twitch viewers hour by hour (make.fun v2fix).
 
 Method (fitted offline on the kit's comparables, validated by leave-one-out):
 every past launch gives a release-day curve of hourly viewers. For a target
@@ -12,13 +12,22 @@ from other big launches; small launches borrow from small ones -- the shape
 of a release day depends strongly on how much of the world was already
 unlocked at 00:00 UTC, which the hour-1 print encodes.
 
-The five quantiles come from the predicted median plus a spread: the spread
-for hour h is the standard deviation of the other launches' leave-one-out
-residuals at that hour, taken from launches whose hour-1 print is near the
-target's (within 1.2 log units), smoothed over neighbouring hours and
-scaled by 0.9. No channels, no pre-release ramp and no early-access filter:
-all three were tested in the bake-off and hurt the big-launch regime that
-GTA VI will be in.
+The five quantiles come from the predicted median plus a spread. Change vs
+v2: the spread is now a KERNEL-WEIGHTED standard deviation of the other
+launches' leave-one-out residuals at that hour (Gaussian weights on
+ln(hour-1) distance, same 1.2 bandwidth as the median fit), instead of an
+unweighted pstdev over a hard +-1.2 log-unit window. Residuals from launches
+whose hour-1 print is close to the target's count most; distant launches
+fade smoothly instead of dropping off a cliff at the window edge.
+
+Peer group: the median and the spread are fitted only on launches whose
+unlock pattern matches the target's -- rolling midnight-local vs
+simultaneous-global. Launches with the same unlock pattern share the same
+intraday shape (a rolling-midnight launch ramps as regions unlock through
+the day; a simultaneous launch spikes at once), and mixing patterns
+confuses the median. The target's pattern is read from the case notes; each
+comparable's from its unlock field. When the matched group is too small the
+full pool is used instead.
 
 Pure Python 3 standard library, deterministic, no network, no model calls.
 Reads every *.in case in $MAKEFUN_INPUT_DIR (else /input) and writes one
@@ -36,7 +45,7 @@ LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 
 BANDWIDTH = 1.2        # Gaussian kernel width on ln(hour-1 viewers)
 SIGMA_SCALE = 0.9      # shrink on the residual spread (pinball-optimal < 1)
-SIGMA_WINDOW = 1.2     # local residual window, in ln(hour-1) units
+SIGMA_BW = 1.2         # kernel width for weighting residuals, in ln(hour-1)
 SIGMA_MIN = 0.10
 SIGMA_MAX = 1.2
 EVAL_HEADROOM = 0.5    # how far past the pool's ln(hour-1) range we extrapolate
@@ -56,12 +65,23 @@ def _hour_index(day_start, when):
     return None
 
 
+def _unlock_pattern(text):
+    """'rolling' (midnight local, regions unlock through the day),
+    'simultaneous' (one global unlock), or 'unknown'."""
+    t = (text or "").lower()
+    if "rolling" in t or "midnight local" in t:
+        return "rolling"
+    if "simultaneous" in t or "single global" in t:
+        return "simultaneous"
+    return "unknown"
+
+
 def extract_curves(case):
     """Release-day curves of the case's comparables.
 
-    Returns a list of dicts: {'lnv1': float, 'day': {hour: viewers}}.
-    A curve joins only if hour 1 exists and at least MIN_DAY_POINTS of
-    hours 2..24 are present with positive viewers.
+    Returns a list of dicts: {'lnv1': float, 'day': {hour: viewers},
+    'pattern': unlock pattern}. A curve joins only if hour 1 exists and at
+    least MIN_DAY_POINTS of hours 2..24 are present with positive viewers.
     """
     curves = []
     for comp in case.get("comparables") or []:
@@ -82,7 +102,8 @@ def extract_curves(case):
             continue
         if sum(1 for h in range(2, 25) if h in day) < MIN_DAY_POINTS:
             continue
-        curves.append({"lnv1": math.log(day[1]), "day": day})
+        curves.append({"lnv1": math.log(day[1]), "day": day,
+                       "pattern": _unlock_pattern(comp.get("unlock"))})
     return curves
 
 
@@ -149,9 +170,29 @@ def _pstdev(values):
     return math.sqrt(sum((v - mean) ** 2 for v in values) / n)
 
 
+def _weighted_pstdev(values, weights):
+    """Kernel-weighted population stddev; None if effective n too small."""
+    sw = sum(weights)
+    if sw <= 0:
+        return None
+    mean = sum(w * v for w, v in zip(weights, values)) / sw
+    var = sum(w * (v - mean) ** 2 for w, v in zip(weights, values)) / sw
+    ess = sw * sw / sum(w * w for w in weights)
+    if ess < 5:
+        return None
+    return math.sqrt(var)
+
+
 def forecast(case):
     """Return the {"hours": [...]} forecast object for one case."""
     pool = extract_curves(case)
+    # Peer group: keep only launches whose unlock pattern matches the
+    # target's (read from the case notes); fall back to the full pool when
+    # the matched group is too small to trust.
+    target_pattern = _unlock_pattern(case.get("notes") or "")
+    matched = [c for c in pool if c["pattern"] == target_pattern]
+    if len(matched) >= MIN_POOL:
+        pool = matched
     known = (case.get("known") or [{}])[0]
     try:
         hour1 = max(float(known["viewers"]), 1.0)
@@ -176,17 +217,17 @@ def forecast(case):
             residuals[hour].append(math.log(day[hour] / day[1]) - pred)
             residual_lnv1[hour].append(curve["lnv1"])
 
-    # Pass 2: spread per hour from residuals near the target's hour-1 level.
+    # Pass 2: spread per hour from kernel-weighted residuals near the target.
     sigmas = {}
     for hour in range(2, 25):
         if len(pool) < MIN_POOL:
             sigmas[hour] = 0.15 * math.sqrt(hour - 1)
             continue
-        local = [r for r, lv in zip(residuals[hour], residual_lnv1[hour])
-                 if abs(lv - lnv1) <= SIGMA_WINDOW]
-        if len(local) < 5:
-            local = residuals[hour]
-        raw = _pstdev(local) if local else 0.3
+        weights = [math.exp(-0.5 * ((lv - lnv1) / SIGMA_BW) ** 2)
+                   for lv in residual_lnv1[hour]]
+        raw = _weighted_pstdev(residuals[hour], weights)
+        if raw is None:
+            raw = _pstdev(residuals[hour]) if residuals[hour] else 0.3
         sigmas[hour] = raw
     smoothed = {}
     for hour in range(2, 25):
